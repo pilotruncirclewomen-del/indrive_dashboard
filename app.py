@@ -1,39 +1,23 @@
 # streamlit_m_posts_dashboard.py
-"""
-Streamlit dashboard for M-posts single-table analytics
-Rewritten to avoid runtime errors:
- - handles missing st.experimental_rerun()
- - handles missing BigQuery Storage client
- - replaces use_container_width with width="stretch"
- - uses safe Streamlit caching
-"""
-
 import os
 import time
 from typing import Tuple, Dict, List
 from datetime import datetime
 
 import pandas as pd
-import numpy as np
-import plotly.express as px
 import streamlit as st
-
 from google.cloud import bigquery
 from google.api_core.exceptions import GoogleAPIError
 from google.oauth2 import service_account
 
-# ---------------------------
-# Config
-# ---------------------------
 st.set_page_config(page_title="M-posts Single-Table Dashboard", layout="wide")
 
-# Update this to your BigQuery table (project.dataset.table)
+# --- CONFIG ---
 PROJECT_TABLE = "pilot-run-turn-bq-integration.923141851055.contacts"
-
 CACHE_TTL_SECONDS = 300
 NUM_M_POSTS = 6
 
-# SQL: extract representative row per whatsapp_id
+# --- SQL: extract one representative row per whatsapp_id with raw values ---
 QUERY = f"""
 WITH raw AS (
   SELECT
@@ -78,61 +62,63 @@ SELECT * FROM agg
 ORDER BY whatsapp_id;
 """
 
-# ---------------------------
-# BigQuery client helper
-# ---------------------------
-@st.cache_data(ttl=24 * 3600)
-def get_bq_client_cached(credentials_path: str = None) -> bigquery.Client:
-    """
-    Create BigQuery client and cache it for 24h to avoid reconnect overhead.
-    If Streamlit secrets provide service account JSON, we'll use that.
-    Otherwise expect GOOGLE_APPLICATION_CREDENTIALS env var.
-    """
-    # prefer Streamlit secrets (Streamlit Cloud)
-    if "gcp_service_account" in st.secrets:
-        creds_info = dict(st.secrets["gcp_service_account"])
-        creds = service_account.Credentials.from_service_account_info(creds_info)
-        client = bigquery.Client(credentials=creds, project=creds_info.get("project_id"))
-        return client
-
-    # else use explicit path from env var or provided parameter
-    path = credentials_path or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if path and os.path.exists(path):
-        creds = service_account.Credentials.from_service_account_file(path)
-        client = bigquery.Client(credentials=creds, project=creds.project_id)
-        return client
-
-    # fallback to default credentials
-    return bigquery.Client()
-
-# ---------------------------
-# Data loader (cached)
-# ---------------------------
+# --- BigQuery loader (cached) ---
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_data_from_bq(query: str) -> Tuple[pd.DataFrame, Dict[str, any]]:
-    client = get_bq_client_cached()
+    """
+    Loads data from BigQuery using either credentials in Streamlit secrets or
+    GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    Uses BigQuery Storage API if available (faster), otherwise falls back to REST.
+    Returns dataframe and some lightweight metadata.
+    """
+    # Build client
+    client = None
+    if "gcp_service_account" in st.secrets:
+        creds_info = dict(st.secrets["gcp_service_account"])
+        credentials = service_account.Credentials.from_service_account_info(creds_info)
+        client = bigquery.Client(
+            credentials=credentials,
+            project=creds_info.get("project_id"),
+        )
+    else:
+        cred = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if not cred:
+            st.error(
+                "Configure 'gcp_service_account' in Streamlit secrets "
+                "or set GOOGLE_APPLICATION_CREDENTIALS locally."
+            )
+            st.stop()
+        client = bigquery.Client()
+
     job = client.query(query)
 
-    # detect BigQuery Storage availability
+    # metadata placeholder
+    metadata = {
+        "job_id": None,
+        "total_bytes_processed": None,
+        "location": None,
+        "queried_at": None,
+    }
+
+    # Detect availability of BigQuery Storage client
     try:
         import google.cloud.bigquery_storage  # noqa: F401
         use_bq_storage = True
     except Exception:
         use_bq_storage = False
 
-    metadata = {"job_id": None, "total_bytes_processed": None, "location": None, "queried_at": None}
+    # Attempt to fetch to dataframe
     try:
-        # try preferred path
         df = job.result().to_dataframe(create_bqstorage_client=use_bq_storage)
     except GoogleAPIError as e:
-        # fallback gracefully if storage client fails
-        st.warning(f"BigQuery Storage API unavailable, falling back to REST: {e}")
+        # BigQuery Storage may be unavailable or error; fall back to REST
+        st.warning(f"BigQuery Storage API unavailable or error, falling back to REST: {e}")
         df = job.result().to_dataframe(create_bqstorage_client=False)
     except Exception as e:
         st.error(f"Failed to fetch results from BigQuery: {e}")
         st.stop()
 
-    # try to collect some metadata
+    # Populate metadata where possible
     try:
         metadata["job_id"] = getattr(job, "job_id", None) or job.job_id
         total_bytes = getattr(job, "total_bytes_processed", None)
@@ -146,10 +132,9 @@ def load_data_from_bq(query: str) -> Tuple[pd.DataFrame, Dict[str, any]]:
     metadata["queried_at"] = datetime.utcnow().isoformat() + "Z"
     return df, metadata
 
-# ---------------------------
-# Utilities
-# ---------------------------
+# --- Helper: coerce strings to numeric for mpost values (for sum) ---
 def parse_numeric_value(s: str) -> float:
+    """Try to convert string to float. Treat '', 'null', 'None' as 0. Non-numeric -> 0."""
     if s is None:
         return 0.0
     s2 = str(s).strip()
@@ -158,40 +143,57 @@ def parse_numeric_value(s: str) -> float:
     try:
         return float(s2)
     except Exception:
+        # try common boolean -> numeric mapping
         if s2.lower() in ("true", "t", "yes", "y"):
             return 1.0
         if s2.lower() in ("false", "f", "no", "n"):
             return 0.0
         return 0.0
 
+# --- Business rule B: completed if mX_value IN {'0','1','2'} (strings) ---
 COMPLETED_VALUES = {"0", "1", "2"}
 
+# --- Prepare dataframe from raw BQ output ---
 def prepare_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     if df_raw is None or df_raw.empty:
-        cols = ["whatsapp_id", "cohort_no"] + [f"m{i}_value" for i in range(1, NUM_M_POSTS + 1)] + \
-               ["completed_count", "sum_mposts_value"] + [f"indrive_module_{i}_value" for i in range(1, NUM_M_POSTS + 1)] + ["sum_indrive"]
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(
+            columns=["whatsapp_id", "cohort_no"] +
+                    [f"m{i}_value" for i in range(1, NUM_M_POSTS + 1)] +
+                    ["completed_count", "sum_mposts_value"] +
+                    [f"indrive_module_{i}_value" for i in range(1, NUM_M_POSTS + 1)] +
+                    ["sum_indrive"]
+        )
 
     df = df_raw.copy()
 
-    # ensure expected columns exist
+    # normalize columns existence
     for i in range(1, NUM_M_POSTS + 1):
-        if f"m{i}_value" not in df.columns:
-            df[f"m{i}_value"] = ""
-        if f"indrive_module_{i}_value" not in df.columns:
-            df[f"indrive_module_{i}_value"] = ""
+        col = f"m{i}_value"
+        if col not in df.columns:
+            df[col] = ""
+        ind_col = f"indrive_module_{i}_value"
+        if ind_col not in df.columns:
+            df[ind_col] = ""
 
+    # ensure whatsapp_id and cohort_no exist
+    if "whatsapp_id" not in df.columns:
+        df["whatsapp_id"] = ""
     df["whatsapp_id"] = df["whatsapp_id"].astype(str).str.strip()
     df["cohort_no"] = df.get("cohort_no", "").astype(str).fillna("").str.strip()
 
-    # per-module completed flag
+    # Completed flag per module according to rule B
     for i in range(1, NUM_M_POSTS + 1):
         col = f"m{i}_value"
         df[f"m{i}_completed_flag"] = df[col].astype(str).str.strip().apply(lambda x: 1 if x in COMPLETED_VALUES else 0)
 
-    df["completed_count"] = df[[f"m{i}_completed_flag" for i in range(1, NUM_M_POSTS + 1)]].sum(axis=1).astype(int)
+    # completed_count = count of modules with completed_flag == 1
+    completed_cols = [f"m{i}_completed_flag" for i in range(1, NUM_M_POSTS + 1)]
+    if completed_cols:
+        df["completed_count"] = df[completed_cols].sum(axis=1).astype(int)
+    else:
+        df["completed_count"] = 0
 
-    # numeric m-post sums
+    # sum_mposts_value = numeric sum of m1..m6 values (coerced)
     numeric_cols_values = []
     for i in range(1, NUM_M_POSTS + 1):
         col = f"m{i}_value"
@@ -200,78 +202,84 @@ def prepare_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         numeric_cols_values.append(num_col)
     df["sum_mposts_value"] = df[numeric_cols_values].sum(axis=1).astype(float)
 
-    # parse indrive to numeric
+    # Parse indrive columns to numeric (handle '1','0','true','false')
     indrive_num_cols = []
     for i in range(1, NUM_M_POSTS + 1):
         ind_col = f"indrive_module_{i}_value"
         ind_num_col = f"indrive_module_{i}_num"
+        # normalize null-ish
         df[ind_col] = df[ind_col].fillna("").astype(str).str.strip()
         def parse_indrive(x: str) -> int:
-            if x is None:
+            if str(x).strip().lower() in ("", "null", "none"):
                 return 0
-            s = str(x).strip().lower()
-            if s in ("", "null", "none"):
-                return 0
-            if s in ("1", "true", "t", "yes", "y"):
+            if str(x).strip().lower() in ("1", "true", "t", "yes", "y"):
                 return 1
-            if s in ("0", "false", "f", "no", "n"):
+            if str(x).strip().lower() in ("0", "false", "f", "no", "n"):
                 return 0
+            # try numeric
             try:
-                return int(float(s))
+                return int(float(x))
             except Exception:
                 return 0
         df[ind_num_col] = df[ind_col].apply(parse_indrive).astype(int)
         indrive_num_cols.append(ind_num_col)
 
-    df["sum_indrive"] = df[indrive_num_cols].sum(axis=1).astype(int)
+    df["sum_indrive"] = df[indrive_num_cols].sum(axis=1).astype(int) if indrive_num_cols else 0
 
-    # select and tidy final columns
-    keep_cols = ["whatsapp_id", "cohort_no"] + [f"m{i}_value" for i in range(1, NUM_M_POSTS + 1)] + \
-                ["completed_count", "sum_mposts_value"] + [f"indrive_module_{i}_value" for i in range(1, NUM_M_POSTS + 1)] + ["sum_indrive"]
-
+    # Final tidy columns
+    keep_cols = ["whatsapp_id", "cohort_no"] \
+                + [f"m{i}_value" for i in range(1, NUM_M_POSTS + 1)] \
+                + ["completed_count", "sum_mposts_value"] \
+                + [f"indrive_module_{i}_value" for i in range(1, NUM_M_POSTS + 1)] \
+                + ["sum_indrive"]
+    # Ensure all exist
     for c in keep_cols:
         if c not in df.columns:
             df[c] = "" if c.endswith("_value") or c == "cohort_no" else 0
-
     df_final = df[keep_cols].drop_duplicates(subset=["whatsapp_id"]).reset_index(drop=True)
     return df_final
 
-# ---------------------------
-# UI: Sidebar controls
-# ---------------------------
+# --- UI: Sidebar (all filters) ---
 st.sidebar.title("Filters & Controls")
 st.sidebar.markdown("**Filter Out Those Who Have Completed Modules Post Quizez**")
 
+# exact completed count filter
 exact_choices = [str(i) for i in range(1, NUM_M_POSTS + 1)]
 selected_exact = st.sidebar.multiselect("Show users who completed exactly:", options=exact_choices, default=[])
 
-only_all_completed = st.sidebar.checkbox("Show only users who completed all modules", value=False)
+# toggle show only completed all modules
+only_all_completed = st.sidebar.checkbox("Show only users who completed all 6 modules", value=False)
 
+# cohort filter placeholder (populated after data load)
 cohort_select = st.sidebar.multiselect("Filter by cohort_no (leave empty for all)", options=[], default=[])
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Top Leader Board Ranking Based On Modules**")
+st.sidebar.write("You can use sum_mposts_value (numeric sum of m1..m6) and sum_indrive to rank/sort in the table.")
 
+# numeric filters for ranking ranges
 min_sum_mposts_val = st.sidebar.number_input("Min sum of m-post values", value=0.0, format="%.2f")
 max_sum_mposts_val = st.sidebar.number_input("Max sum of m-post values", value=1_000_000.0, format="%.2f")
 min_sum_indrive = st.sidebar.number_input("Min sum_indrive", value=0, step=1)
 max_sum_indrive = st.sidebar.number_input("Max sum_indrive", value=NUM_M_POSTS, step=1)
 
 st.sidebar.markdown("---")
+st.sidebar.markdown("**Filter by indrive module status (require selected modules = chosen value)**")
 indrive_options = [f"indrive_module_{i}_value" for i in range(1, NUM_M_POSTS + 1)]
 selected_indrive_modules = st.sidebar.multiselect("Select indrive modules (AND semantics):", options=indrive_options, default=[])
 indrive_value_choice = st.sidebar.selectbox("Require selected indrive modules to be:", options=["1", "0"], index=0)
 
 st.sidebar.markdown("---")
 
-# Refresh button with robust rerun fallback
+# Robust Refresh button: clear cached data and trigger a rerun (works across Streamlit versions)
 if st.sidebar.button("Refresh data (clear cache)"):
     try:
         st.cache_data.clear()
     except Exception:
+        # Some Streamlit versions may behave differently; ignore errors
         pass
 
-    # prefer experimental_rerun if available
+    # Use experimental_rerun() if present; otherwise change query params to force rerun
     if hasattr(st, "experimental_rerun"):
         try:
             st.experimental_rerun()
@@ -282,83 +290,99 @@ if st.sidebar.button("Refresh data (clear cache)"):
         st.experimental_set_query_params(_refresh=int(time.time()))
         st.stop()
 
-# ---------------------------
-# Load and prepare data
-# ---------------------------
+# --- Load and prepare data ---
 with st.spinner("Loading data from BigQuery..."):
     raw_df, meta = load_data_from_bq(QUERY)
 
 df = prepare_dataframe(raw_df)
 
-# populate cohort options
+# populate cohort select options now that df is ready
 unique_cohorts = sorted([c for c in df["cohort_no"].unique() if str(c).strip() not in ("", "None", "null")])
 if unique_cohorts:
+    # if user hasn't set cohort_select yet, keep it empty by default
     cohort_select = st.sidebar.multiselect("Filter by cohort_no (leave empty for all)", options=unique_cohorts, default=cohort_select)
 
-# ---------------------------
-# Apply filters
-# ---------------------------
+# --- Apply filters (in this order) ---
 mask = pd.Series(True, index=df.index)
 
+# cohort filter
 if cohort_select:
     mask &= df["cohort_no"].isin(cohort_select)
 
+# exact completed count filter
 if selected_exact:
     desired = set(int(x) for x in selected_exact)
     mask &= df["completed_count"].isin(desired)
 
+# only all completed toggle (overrides/combines with above, keep AND semantics)
 if only_all_completed:
     mask &= df["completed_count"] == NUM_M_POSTS
 
+# sum_mposts_value numeric range
 mask &= df["sum_mposts_value"].between(float(min_sum_mposts_val), float(max_sum_mposts_val))
+
+# sum_indrive numeric range
 mask &= df["sum_indrive"].between(int(min_sum_indrive), int(max_sum_indrive))
 
+# indrive module filters (AND): require selected indrive modules to equal chosen value
 if selected_indrive_modules:
+    # map indrive_value_choice to int (0 or 1)
     try:
         required_val = int(indrive_value_choice)
     except Exception:
         required_val = 1 if str(indrive_value_choice).lower() in ("1", "true", "yes") else 0
     for col in selected_indrive_modules:
-        num_col = col.replace("_value", "_num")
+        # col is like indrive_module_1_value -> we compare to parsed numeric column created earlier?
+        num_col = col.replace("_value", "_num")  # indrive_module_1_num
         if num_col in df.columns:
             mask &= df[num_col] == required_val
         else:
+            # For safety, try to compute on-the-fly:
             def parse_indrive_val(x):
-                s = str(x).strip().lower()
-                if s in ("", "null", "none"):
+                if str(x).strip().lower() in ("", "null", "none"):
                     return 0
-                if s in ("1", "true", "t", "yes", "y"):
+                if str(x).strip().lower() in ("1", "true", "t", "yes", "y"):
                     return 1
-                if s in ("0", "false", "f", "no", "n"):
+                if str(x).strip().lower() in ("0", "false", "f", "no", "n"):
                     return 0
                 try:
-                    return int(float(s))
+                    return int(float(x))
                 except Exception:
                     return 0
             mask &= df[col].apply(parse_indrive_val) == required_val
 
 filtered = df.loc[mask].copy().reset_index(drop=True)
 
-# ensure numeric indrive display columns exist
+# --- Add indrive_num columns into filtered for display sorting if not present ---
 for i in range(1, NUM_M_POSTS + 1):
     num_col = f"indrive_module_{i}_num"
     val_col = f"indrive_module_{i}_value"
     if num_col not in filtered.columns and val_col in filtered.columns:
+        # create numeric view column
         filtered[num_col] = filtered[val_col].apply(lambda x: 1 if str(x).strip().lower() in ("1", "true", "yes", "y") else 0)
 
-# Display
-display_cols = ["whatsapp_id", "cohort_no"] + [f"m{i}_value" for i in range(1, NUM_M_POSTS + 1)] + \
-               ["completed_count", "sum_mposts_value"] + [f"indrive_module_{i}_value" for i in range(1, NUM_M_POSTS + 1)] + ["sum_indrive"]
+# --- Build display columns and show one table only ---
+display_cols = [
+    "whatsapp_id",
+    "cohort_no",
+] + [f"m{i}_value" for i in range(1, NUM_M_POSTS + 1)] + [
+    "completed_count",
+    "sum_mposts_value",
+] + [f"indrive_module_{i}_value" for i in range(1, NUM_M_POSTS + 1)] + [
+    "sum_indrive"
+]
+
 display_cols = [c for c in display_cols if c in filtered.columns]
 
 st.title("M-posts — Single Table Dashboard")
-st.markdown("**Table shows unique WhatsApp IDs and supports requested filters.**")
+st.markdown("**Table shows unique WhatsApp IDs and supports all requested filters.**")
 st.write(f"Query run at: {meta.get('queried_at','n/a')} — rows after filter: {len(filtered):,}")
 
-# Use width="stretch" instead of use_container_width
+# Show table (single view). Users can sort columns via the Streamlit dataframe UI.
+# use width='stretch' to replace deprecated use_container_width=True
 st.dataframe(filtered[display_cols], width="stretch", height=700)
 
-# CSV download helper
+# CSV download
 @st.cache_data
 def to_csv_bytes(df_: pd.DataFrame) -> bytes:
     return df_.to_csv(index=False).encode("utf-8")
