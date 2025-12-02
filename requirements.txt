@@ -1,0 +1,13 @@
+streamlit
+pandas
+google-cloud-bigquery
+google-api-core
+db-dtypes
+pyarrow
+plotly
+google-auth
+google-auth-oauthlib
+matplotlib
+seaborn
+
+#export GOOGLE_APPLICATION_CREDENTIALS="pilot-run-turn-bq-integration-6aef543e26a5.json"    
