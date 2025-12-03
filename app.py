@@ -1,7 +1,6 @@
-# streamlit_bq_messages_dashboard.py
 """
 Patched Streamlit Dashboard with:
- - Modal popup login (credentials read from st.secrets['auth'])
+ - Modal popup login using st.container (works with current Streamlit)
  - Refresh button that reliably clears cache and reloads
  - Use st.data_editor for tables so CSV download preserves UI sorting
  - Backwards-compatible handling for st.experimental_rerun absence
@@ -312,42 +311,74 @@ def plot_heatmap(df: pd.DataFrame, title: str = "Activity Heatmap"):
 # Streamlit UI
 # ---------------------------
 
+def show_login_modal():
+    """Display login form using CSS styling to create modal effect"""
+    st.markdown("""
+    <style>
+    .login-container {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background: white;
+        padding: 2rem;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        z-index: 9999;
+        width: 90%;
+        max-width: 400px;
+    }
+    .login-backdrop {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0, 0, 0, 0.5);
+        z-index: 9998;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    col = st.columns([1, 2, 1])[1]
+    with col:
+        st.markdown("### 🔐 Login to Dashboard")
+        st.markdown("---")
+        user_in = st.text_input("Username", value="", key="login_user")
+        pass_in = st.text_input("Password", type="password", key="login_pass")
+        col1, col2 = st.columns(2)
+        with col1:
+            submit = st.button("Login", use_container_width=True, type="primary")
+        with col2:
+            st.button("Cancel", use_container_width=True, disabled=True)
+        
+        return user_in, pass_in, submit
+
 def main():
     st.set_page_config(page_title="Messages Analytics Dashboard", layout="wide")
     st.title("Messages Analytics Dashboard")
     st.markdown("Analyze user engagement patterns from the BigQuery `messages` table.")
 
-    # --- Authentication (modal)
+    # --- Authentication (modal-like)
     auth_secrets = st.secrets.get("auth", {}) if hasattr(st, "secrets") else {}
-    AUTH_USERNAME = auth_secrets.get("username", "Admin")
+    AUTH_USERNAME = auth_secrets.get("username", "admin")
     AUTH_PASSWORD = auth_secrets.get("password", "admin123@#")
 
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
         st.session_state.username = None
 
-    # show modal login if not authenticated
+    # show login if not authenticated
     if not st.session_state.authenticated:
-        with st.modal("Login to Dashboard"):
-            st.markdown("### Please sign in")
-            user_in = st.text_input("Username", value="")
-            pass_in = st.text_input("Password", type="password")
-            if st.button("Login"):
-                if str(user_in) == str(AUTH_USERNAME) and str(pass_in) == str(AUTH_PASSWORD):
-                    st.session_state.authenticated = True
-                    st.session_state.username = user_in
-                    # reload main view
-                    if hasattr(st, "experimental_rerun"):
-                        try:
-                            st.experimental_rerun()
-                        except Exception:
-                            st.experimental_set_query_params(_login=int(time.time()))
-                            st.stop()
-                    else:
-                        st.experimental_set_query_params(_login=int(time.time()))
-                        st.stop()
-                else:
-                    st.error("Invalid username or password")
+        user_in, pass_in, submit = show_login_modal()
+        
+        if submit:
+            if str(user_in) == str(AUTH_USERNAME) and str(pass_in) == str(AUTH_PASSWORD):
+                st.session_state.authenticated = True
+                st.session_state.username = user_in
+                st.rerun()
+            else:
+                st.error("❌ Invalid username or password")
         return
 
     # Sidebar: account and actions
@@ -356,15 +387,7 @@ def main():
     if st.sidebar.button("Logout"):
         st.session_state.authenticated = False
         st.session_state.username = None
-        if hasattr(st, "experimental_rerun"):
-            try:
-                st.experimental_rerun()
-            except Exception:
-                st.experimental_set_query_params(_logout=int(time.time()))
-                st.stop()
-        else:
-            st.experimental_set_query_params(_logout=int(time.time()))
-            st.stop()
+        st.rerun()
 
     # Sidebar: Refresh button (clears Streamlit caches and forces rerun)
     st.sidebar.markdown("---")
@@ -374,16 +397,7 @@ def main():
             st.cache_resource.clear()
         except Exception:
             pass
-        # change a query param to force a rerun if experimental_rerun isn't available
-        if hasattr(st, "experimental_rerun"):
-            try:
-                st.experimental_rerun()
-            except Exception:
-                st.experimental_set_query_params(_refresh=int(time.time()))
-                st.stop()
-        else:
-            st.experimental_set_query_params(_refresh=int(time.time()))
-            st.stop()
+        st.rerun()
 
     # stop early if not authenticated (safety)
     if not st.session_state.get("authenticated"):
