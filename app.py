@@ -1,8 +1,17 @@
-
+"""
+Corrected Streamlit dashboard for BigQuery messages table.
+- Moved auth UI to main()
+- Fixed get_unique_user_count() (no UI, no syntax errors)
+- Added time import and robust rerun fallback
+- Replaced deprecated use_container_width with width="stretch"
+- Detects BigQuery Storage availability safely
+- Avoids caching functions that contain UI
+"""
 
 import os
+import time
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Tuple, Dict
 
 import pandas as pd
 import numpy as np
@@ -11,6 +20,7 @@ import streamlit as st
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
+from google.api_core.exceptions import GoogleAPIError
 
 # ---------------------------
 # CONFIG
@@ -19,16 +29,12 @@ PROJECT_ID = "pilot-run-turn-bq-integration"
 DATASET = "923141851055"
 MESSAGES_TABLE = "messages"
 
-# Path to JSON credential file provided by user
+# Path to JSON credential file provided by user (use env or st.secrets in production)
 CREDENTIALS_PATH = "/Users/maysam/Desktop/AUSTIN-BIKEHSHARE-main/pilot-run-turn-bq-integration-6aef543e26a5.json"
 
 # Leaderboard cache TTL (seconds)
 LEADERBOARD_TTL = 3600  # 1 hour
-
-# Page size for user listing in sidebar
 USERS_PAGE_SIZE = 100
-
-# Top N users to fetch for leaderboard (cap at 1000 as requested)
 LEADERBOARD_LIMIT = 1000
 
 # ---------------------------
@@ -36,9 +42,7 @@ LEADERBOARD_LIMIT = 1000
 # ---------------------------
 @st.cache_resource
 def get_bq_client(credentials_path: str = CREDENTIALS_PATH) -> bigquery.Client:
-    """Create and cache a BigQuery client using the provided service account JSON.
-    Uses @st.cache_resource so the client isn't re-created on every run.
-    """
+    """Create and cache a BigQuery client."""
     if credentials_path and os.path.exists(credentials_path):
         creds = service_account.Credentials.from_service_account_file(credentials_path)
         client = bigquery.Client(credentials=creds, project=creds.project_id)
@@ -46,97 +50,48 @@ def get_bq_client(credentials_path: str = CREDENTIALS_PATH) -> bigquery.Client:
         client = bigquery.Client()
     return client
 
-# Helper to reference table
+
 def table_ref() -> str:
     return f"`{PROJECT_ID}.{DATASET}.{MESSAGES_TABLE}`"
 
+
+def _bq_storage_available() -> bool:
+    try:
+        import google.cloud.bigquery_storage  # noqa: F401
+        return True
+    except Exception:
+        return False
+
 # ---------------------------
-# Data access functions
+# Data access functions (no UI inside cached functions)
 # ---------------------------
 @st.cache_data(ttl=300)
-def get_unique_user_count() -> int:
-    # --- Authentication (credentials from st.secrets) ---
-    # Place credentials in .streamlit/secrets.toml or Streamlit Cloud secrets as:
-    # [auth]
-    # username = "Admin"
-    # password = "admin123@#"
-    auth_secrets = st.secrets.get("auth", {}) if hasattr(st, "secrets") else {}
-    AUTH_USERNAME = auth_secrets.get("username", "Admin")
-    AUTH_PASSWORD = auth_secrets.get("password", "admin123@#")
-
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-        st.session_state.username = None
-
-    def _check_login(u: str, p: str) -> bool:
-        return str(u) == str(AUTH_USERNAME) and str(p) == str(AUTH_PASSWORD)
-
-    # Sidebar auth UI
-    st.sidebar.header("Account")
-    if st.session_state.get("authenticated"):
-        st.sidebar.write(f"Logged in as **{st.session_state.get('username')}**")
-        if st.sidebar.button("Logout"):
-            st.session_state.authenticated = False
-            st.session_state.username = None
-            try:
-                if hasattr(st, "experimental_rerun"):
-                    st.experimental_rerun()
-                else:
-                    st.experimental_set_query_params(_logout=int(time.time()))
-                    st.stop()
-            except Exception:
-                st.experimental_set_query_params(_logout=int(time.time()))
-                st.stop()
-    else:
-        st.sidebar.subheader("Login to access dashboard")
-        _user_in = st.sidebar.text_input("Username", value="")
-        _pass_in = st.sidebar.text_input("Password", type="password")
-        if st.sidebar.button("Login"):
-            if _check_login(_user_in, _pass_in):
-                st.session_state.authenticated = True
-                st.session_state.username = _user_in
-                st.sidebar.success("Logged in successfully")
-                try:
-                    if hasattr(st, "experimental_rerun"):
-                        st.experimental_rerun()
-                    else:
-                        st.experimental_set_query_params(_login=int(time.time()))
-                        st.stop()
-                except Exception:
-                    st.experimental_set_query_params(_login=int(time.time()))
-                    st.stop()
-            else:
-                st.sidebar.error("Invalid username or password")
-
-    # If not authenticated, stop before doing heavy work
-    if not st.session_state.get("authenticated"):
-        st.sidebar.info("Please login with your credentials to view the dashboard.")
-        st.sidebar.caption("Provide auth credentials via st.secrets under [auth] for production.")
-        return
-
+def get_unique_user_count_bq() -> int:
+    """Query distinct users using addressees array (fallback to raw_body if needed)."""
     client = get_bq_client()
-    q = f"""
-    SELECT COUNT(DISTINCT JSON_EXTRACT_SCALAR(addressees, '$[0]')) AS cnt
-    FROM {table_ref()}
-    WHERE addressees IS NOT NULL
-    """
-    row = list(client.query(q).result())[0]
-    return int(row.cnt) if row and row.cnt is not None else 0
+    # Primary: use addressees array
+    try:
+        q = f"""
+        SELECT COUNT(DISTINCT JSON_EXTRACT_SCALAR(addressees, '$[0]')) AS cnt
+        FROM {table_ref()}
+        WHERE addressees IS NOT NULL
+        """
+        row = list(client.query(q).result())[0]
+        return int(row.cnt) if row and row.cnt is not None else 0
+    except Exception:
+        # Fallback: try JSON in raw_body
+        try:
+            q2 = f"SELECT COUNT(DISTINCT JSON_EXTRACT_SCALAR(raw_body, '$.wa_id')) AS cnt FROM {table_ref()}"
+            row2 = list(client.query(q2).result())[0]
+            return int(row2.cnt) if row2 and row2.cnt is not None else 0
         except Exception:
-            continue
+            return 0
 
-    # fallback: JSON extraction from raw_body
-    q = f"SELECT COUNT(DISTINCT JSON_EXTRACT_SCALAR(raw_body, '$.wa_id')) as cnt FROM {table_ref()}"
-    job = client.query(q)
-    res = job.result()
-    row = list(res)[0]
-    return int(row.cnt)
 
 @st.cache_data(ttl=300)
 def list_users_page(page: int = 0, page_size: int = USERS_PAGE_SIZE, order_by_engagement: bool = False) -> pd.DataFrame:
     client = get_bq_client()
     offset = page * page_size
-
     if order_by_engagement:
         q = f"""
         SELECT user_phone, message_count FROM (
@@ -160,24 +115,21 @@ def list_users_page(page: int = 0, page_size: int = USERS_PAGE_SIZE, order_by_en
         ORDER BY user_phone
         LIMIT {page_size} OFFSET {offset}
         """
-
-    df = client.query(q).result().to_dataframe(create_bqstorage_client=False)
-    # normalize column name to 'user_identifier' used elsewhere
+    df = client.query(q).result().to_dataframe(create_bqstorage_client=_bq_storage_available())
     if 'user_phone' in df.columns:
         df = df.rename(columns={'user_phone': 'user_identifier'})
     return df
 
+
 @st.cache_data(ttl=300)
 def get_user_messages(user_identifier: str, start: datetime = None, end: datetime = None, limit: int = 100000) -> pd.DataFrame:
     client = get_bq_client()
-
     time_filter = ""
     if start and end:
         time_filter = (
             f"AND COALESCE(SAFE_CAST(inserted_at AS TIMESTAMP), SAFE_CAST(JSON_EXTRACT_SCALAR(raw_body, '$.timestamp') AS TIMESTAMP)) "
             f"BETWEEN TIMESTAMP('{start.isoformat()}') AND TIMESTAMP('{end.isoformat()}')"
         )
-
     q = f"""
     SELECT
       JSON_EXTRACT_SCALAR(addressees, '$[0]') AS user_identifier,
@@ -193,15 +145,15 @@ def get_user_messages(user_identifier: str, start: datetime = None, end: datetim
     ORDER BY timestamp ASC
     LIMIT {limit}
     """
-
     job_config = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("user_identifier", "STRING", user_identifier)]
     )
     job = client.query(q, job_config=job_config)
-    df = job.result().to_dataframe(create_bqstorage_client=False)
+    df = job.result().to_dataframe(create_bqstorage_client=_bq_storage_available())
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"])
     return df
+
 
 @st.cache_data(ttl=LEADERBOARD_TTL)
 def precompute_leaderboard(limit: int = LEADERBOARD_LIMIT) -> pd.DataFrame:
@@ -243,7 +195,7 @@ def precompute_leaderboard(limit: int = LEADERBOARD_LIMIT) -> pd.DataFrame:
     ORDER BY total_minutes DESC
     LIMIT {limit}
     """
-    df = client.query(q).result().to_dataframe(create_bqstorage_client=False)
+    df = client.query(q).result().to_dataframe(create_bqstorage_client=_bq_storage_available())
     if not df.empty:
         df["percentage_of_total"] = df["total_minutes"] / df["total_minutes"].sum() * 100
         df["first_message"] = pd.to_datetime(df["first_message"])
@@ -261,7 +213,7 @@ def _minutes_to_hm(minutes: int) -> str:
 
 
 def compute_user_metrics(df: pd.DataFrame, analysis_end: datetime = None) -> dict:
-    if df.empty:
+    if df is None or df.empty:
         return {}
     df = df.copy().sort_values("timestamp")
 
@@ -270,8 +222,8 @@ def compute_user_metrics(df: pd.DataFrame, analysis_end: datetime = None) -> dic
 
     # Default analysis window: most recent full day (24 hours before last message)
     if analysis_end is None:
-        last_msg = df["timestamp"].max()
-        analysis_end = (last_msg.floor('D') + pd.Timedelta(days=1))
+        last_msg = pd.to_datetime(df["timestamp"].max())
+        analysis_end = (last_msg.normalize() + pd.Timedelta(days=1))
     analysis_start = analysis_end - pd.Timedelta(days=1)
 
     window_df = df[(df["timestamp"] >= analysis_start) & (df["timestamp"] < analysis_end)]
@@ -279,7 +231,7 @@ def compute_user_metrics(df: pd.DataFrame, analysis_end: datetime = None) -> dic
     def compute_sessions_minutes(series_ts: pd.Series) -> float:
         if series_ts.empty:
             return 0.0
-        times = series_ts.sort_values()
+        times = pd.to_datetime(series_ts).sort_values()
         diffs = times.diff().dt.total_seconds().fillna(0)
         session_breaks = diffs > 1800
         session_ids = session_breaks.cumsum()
@@ -300,17 +252,14 @@ def compute_user_metrics(df: pd.DataFrame, analysis_end: datetime = None) -> dic
         peak_count = int(hist.max())
 
     # Highest individual engagement sliding 24-hour window
-    timestamps = df["timestamp"].sort_values().reset_index(drop=True)
+    timestamps = pd.to_datetime(df["timestamp"]).sort_values().reset_index(drop=True)
     max_minutes = 0.0
     max_start = None
     if not timestamps.empty:
-        j = 0
         for i in range(len(timestamps)):
             start_ts = timestamps[i]
             window_end_ts = start_ts + pd.Timedelta(days=1)
-            while j < len(timestamps) and timestamps[j] <= window_end_ts:
-                j += 1
-            window_slice = timestamps[i:j]
+            window_slice = timestamps[(timestamps >= start_ts) & (timestamps <= window_end_ts)]
             minutes = compute_sessions_minutes(window_slice)
             if minutes > max_minutes:
                 max_minutes = minutes
@@ -337,51 +286,103 @@ def compute_user_metrics(df: pd.DataFrame, analysis_end: datetime = None) -> dic
 # ---------------------------
 
 def plot_hourly_activity(df: pd.DataFrame, title: str = "Hourly Activity"):
-    if df.empty:
+    if df is None or df.empty:
         st.info("No messages for the selected period/user.")
         return
     df = df.copy()
-    df["hour"] = df["timestamp"].dt.hour
+    df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
     hourly = df.groupby("hour").size().reindex(range(24), fill_value=0).reset_index()
     hourly.columns = ["hour", "count"]
     fig = px.line(hourly, x="hour", y="count", markers=True, title=title)
     fig.update_xaxes(tickmode="linear")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
+
 
 def plot_heatmap(df: pd.DataFrame, title: str = "Activity Heatmap"):
-    if df.empty:
+    if df is None or df.empty:
         return
     df = df.copy()
-    df["hour"] = df["timestamp"].dt.hour
-    df["date"] = df["timestamp"].dt.date
+    df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
+    df["date"] = pd.to_datetime(df["timestamp"]).dt.date
     pivot = df.groupby(["date", "hour"]).size().unstack(fill_value=0)
     pivot = pivot.sort_index()
-    fig = px.imshow(pivot.T, aspect="auto", labels=dict(x="Date", y="Hour", color="Messages"), x=pivot.index.astype(str), y=pivot.columns)
+    fig = px.imshow(pivot.T.values, aspect="auto", labels=dict(x="Date", y="Hour", color="Messages"), x=pivot.index.astype(str), y=pivot.columns)
     fig.update_layout(title=title)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 # ---------------------------
 # Streamlit UI
 # ---------------------------
 
 def main():
-    st.set_page_config(page_title="Messages Analytics Dashboard", layout="wide")
+    # single set_page_config at top-level already applied; don't reapply here
     st.title("Messages Analytics Dashboard")
     st.markdown("Analyze user engagement patterns from the BigQuery `messages` table.")
+
+    # --- Auth UI (moved out of cached functions) ---
+    auth_secrets = st.secrets.get("auth", {}) if hasattr(st, "secrets") else {}
+    AUTH_USERNAME = auth_secrets.get("username", "Admin")
+    AUTH_PASSWORD = auth_secrets.get("password", "admin123@#")
+
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+        st.session_state.username = None
+
+    with st.sidebar:
+        st.header("Account")
+        if st.session_state.get("authenticated"):
+            st.write(f"Logged in as **{st.session_state.get('username')}**")
+            if st.button("Logout"):
+                st.session_state.authenticated = False
+                st.session_state.username = None
+                # trigger rerun
+                try:
+                    if hasattr(st, "experimental_rerun"):
+                        st.experimental_rerun()
+                    else:
+                        st.experimental_set_query_params(_logout=int(time.time()))
+                        st.stop()
+                except Exception:
+                    st.experimental_set_query_params(_logout=int(time.time()))
+                    st.stop()
+        else:
+            st.subheader("Login to access dashboard")
+            _user_in = st.text_input("Username", value="")
+            _pass_in = st.text_input("Password", type="password")
+            if st.button("Login"):
+                if str(_user_in) == str(AUTH_USERNAME) and str(_pass_in) == str(AUTH_PASSWORD):
+                    st.session_state.authenticated = True
+                    st.session_state.username = _user_in
+                    st.success("Logged in successfully")
+                    try:
+                        if hasattr(st, "experimental_rerun"):
+                            st.experimental_rerun()
+                        else:
+                            st.experimental_set_query_params(_login=int(time.time()))
+                            st.stop()
+                    except Exception:
+                        st.experimental_set_query_params(_login=int(time.time()))
+                        st.stop()
+                else:
+                    st.error("Invalid username or password")
+
+    if not st.session_state.get("authenticated"):
+        st.sidebar.info("Please login with your credentials to view the dashboard.")
+        st.sidebar.caption("Provide auth credentials via st.secrets under [auth] for production.")
+        return
 
     client = get_bq_client()
 
     # Header summary
     with st.container():
-        col1, col2, col3, col4 = st.columns([3,1,1,1])
+        col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
         try:
-            total_users = get_unique_user_count()
+            total_users = get_unique_user_count_bq()
         except Exception as e:
             total_users = "Unknown"
             st.error(f"Error fetching unique user count: {e}")
 
         col1.metric("Unique Users", f"{total_users:,}" if isinstance(total_users, int) else total_users)
-        # total records processed count (quick estimate via query)
         try:
             q = f"SELECT COUNT(1) as cnt FROM {table_ref()}"
             cnt = list(client.query(q).result())[0].cnt
@@ -394,19 +395,35 @@ def main():
     # Sidebar controls
     st.sidebar.header("Filters & Controls")
     mode = st.sidebar.selectbox("Display Mode", ["Single User View", "Leaderboard View"]) 
-    # Date pickers
     start_date = st.sidebar.date_input("Start date (optional)", value=None)
     end_date = st.sidebar.date_input("End date (optional)", value=None)
 
-    # user selection with pagination
     st.sidebar.markdown("---")
     st.sidebar.subheader("Select User / Phone Number")
     page = st.sidebar.number_input("Users page", min_value=0, value=0, step=1)
     order_by_eng = st.sidebar.checkbox("Order users by engagement", value=False)
     users_df = list_users_page(page=page, page_size=USERS_PAGE_SIZE, order_by_engagement=order_by_eng)
-    users_list = users_df["user_identifier"].dropna().astype(str).tolist()
+    users_list = users_df.get("user_identifier", pd.Series(dtype=str)).dropna().astype(str).tolist()
     users_list_display = ["View All"] + users_list
     selected_users = st.sidebar.multiselect("Choose user(s)", options=users_list_display, default=[users_list_display[0]])
+
+    # Refresh control
+    st.sidebar.markdown("---")
+    if st.sidebar.button("Refresh data (clear cache)"):
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        # trigger rerun
+        try:
+            if hasattr(st, "experimental_rerun"):
+                st.experimental_rerun()
+            else:
+                st.experimental_set_query_params(_refresh=int(time.time()))
+                st.stop()
+        except Exception:
+            st.experimental_set_query_params(_refresh=int(time.time()))
+            st.stop()
 
     # Main layout
     if mode == "Single User View":
@@ -416,7 +433,6 @@ def main():
         else:
             for user in selected_users:
                 st.subheader(f"User: {user}")
-                # parse date inputs
                 s = None
                 e = None
                 if start_date and end_date:
@@ -432,7 +448,6 @@ def main():
                 user_msgs = get_user_messages(user, start=s, end=e)
                 metrics = compute_user_metrics(user_msgs, analysis_end=e)
 
-                # Metric cards
                 col1, col2, col3, col4 = st.columns(4)
                 if metrics:
                     col1.metric("First Chat Date", metrics["first_interaction"].strftime("%Y-%m-%d %H:%M:%S"))
@@ -451,7 +466,7 @@ def main():
                 st.markdown("**Hourly distribution (selected period)**")
                 plot_hourly_activity(user_msgs, title=f"Hourly Activity for {user}")
                 with st.expander("Show raw messages (first 500)"):
-                    st.dataframe(user_msgs.head(500))
+                    st.dataframe(user_msgs.head(500), width="stretch")
 
     else:
         st.header("Leaderboard View — Top Users by Total Interaction Minutes")
@@ -467,18 +482,19 @@ def main():
 
             leaderboard_display["rank"] = range(1, len(leaderboard_display) + 1)
             cols = ["rank", "user_identifier", "total_minutes", "percentage_of_total", "message_count", "avg_session_minutes", "first_message", "last_message"]
-            st.dataframe(leaderboard_display[cols], use_container_width=True)
+            st.dataframe(leaderboard_display[cols], width="stretch")
 
             top_n = st.slider("Top N users to chart", min_value=5, max_value=100, value=10)
             top_df = leaderboard_display.head(top_n)
             fig = px.bar(top_df, x="user_identifier", y="total_minutes", title=f"Top {top_n} Users by Total Minutes")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             csv = leaderboard_display.to_csv(index=False)
             st.download_button("Export Leaderboard CSV", csv, file_name="leaderboard_top_users.csv")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("Built for large datasets. Uses BigQuery sessionization and Streamlit caching for performance.")
+
 
 if __name__ == '__main__':
     main()
