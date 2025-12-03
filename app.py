@@ -1,22 +1,21 @@
+# streamlit_bq_messages_dashboard.py
 """
-Streamlit Dashboard: BigQuery Messages Analysis
-File: streamlit_bq_messages_dashboard.py
+Patched Streamlit Dashboard with:
+ - Modal popup login (credentials read from st.secrets['auth'])
+ - Refresh button that reliably clears cache and reloads
+ - Use st.data_editor for tables so CSV download preserves UI sorting
+ - Backwards-compatible handling for st.experimental_rerun absence
+ - Uses existing BigQuery functions from original file
 
-Purpose:
- - Analyze user interaction patterns from the BigQuery `messages` table (~5M rows)
- - Provide sidebar filters, single-user metrics, and a Top-1000 leaderboard
+Run:
+    streamlit run streamlit_bq_messages_dashboard.py
 
-Configuration:
- - Update PROJECT_ID, DATASET, MESSAGES_TABLE variables if needed
- - Set GOOGLE_APPLICATION_CREDENTIALS environment variable OR set CREDENTIALS_PATH below
+Make sure to set st.secrets with an [auth] section:
+[auth]
+username = "admin"
+password = "admin123@#"
 
-Usage:
- 1) Install dependencies: pip install streamlit pandas numpy google-cloud-bigquery google-auth plotly google-cloud-bigquery-storage
- 2) Run: streamlit run streamlit_bq_messages_dashboard.py
-
-Notes:
- - This file is formatted and regenerated to avoid decorator/indentation issues.
- - Cached functions do NOT accept a BigQuery client parameter to avoid Streamlit hashing issues.
+And ensure CREDENTIALS_PATH is valid or GOOGLE_APPLICATION_CREDENTIALS env var is set.
 """
 
 import os
@@ -56,9 +55,6 @@ LEADERBOARD_LIMIT = 1000
 # ---------------------------
 @st.cache_resource
 def get_bq_client(credentials_path: str = CREDENTIALS_PATH) -> bigquery.Client:
-    """Create and cache a BigQuery client using the provided service account JSON.
-    Uses @st.cache_resource so the client isn't re-created on every run.
-    """
     if credentials_path and os.path.exists(credentials_path):
         creds = service_account.Credentials.from_service_account_file(credentials_path)
         client = bigquery.Client(credentials=creds, project=creds.project_id)
@@ -66,12 +62,12 @@ def get_bq_client(credentials_path: str = CREDENTIALS_PATH) -> bigquery.Client:
         client = bigquery.Client()
     return client
 
-# Helper to reference table
+
 def table_ref() -> str:
     return f"`{PROJECT_ID}.{DATASET}.{MESSAGES_TABLE}`"
 
 # ---------------------------
-# Data access functions
+# Data access functions (unchanged semantics)
 # ---------------------------
 @st.cache_data(ttl=300)
 def get_unique_user_count() -> int:
@@ -114,7 +110,6 @@ def list_users_page(page: int = 0, page_size: int = USERS_PAGE_SIZE, order_by_en
         """
 
     df = client.query(q).result().to_dataframe(create_bqstorage_client=False)
-    # normalize column name to 'user_identifier' used elsewhere
     if 'user_phone' in df.columns:
         df = df.rename(columns={'user_phone': 'user_identifier'})
     return df
@@ -322,7 +317,7 @@ def main():
     st.title("Messages Analytics Dashboard")
     st.markdown("Analyze user engagement patterns from the BigQuery `messages` table.")
 
-    # --- Authentication (simple local check) ---
+    # --- Authentication (modal)
     auth_secrets = st.secrets.get("auth", {}) if hasattr(st, "secrets") else {}
     AUTH_USERNAME = auth_secrets.get("username", "Admin")
     AUTH_PASSWORD = auth_secrets.get("password", "admin123@#")
@@ -331,42 +326,55 @@ def main():
         st.session_state.authenticated = False
         st.session_state.username = None
 
+    # show modal login if not authenticated
+    if not st.session_state.authenticated:
+        with st.modal("Login to Dashboard"):
+            st.markdown("### Please sign in")
+            user_in = st.text_input("Username", value="")
+            pass_in = st.text_input("Password", type="password")
+            if st.button("Login"):
+                if str(user_in) == str(AUTH_USERNAME) and str(pass_in) == str(AUTH_PASSWORD):
+                    st.session_state.authenticated = True
+                    st.session_state.username = user_in
+                    # reload main view
+                    if hasattr(st, "experimental_rerun"):
+                        try:
+                            st.experimental_rerun()
+                        except Exception:
+                            st.experimental_set_query_params(_login=int(time.time()))
+                            st.stop()
+                    else:
+                        st.experimental_set_query_params(_login=int(time.time()))
+                        st.stop()
+                else:
+                    st.error("Invalid username or password")
+        return
+
+    # Sidebar: account and actions
     st.sidebar.header("Account")
-    if st.session_state.get("authenticated"):
-        st.sidebar.write(f"Logged in as **{st.session_state.get('username')}**")
-        if st.sidebar.button("Logout"):
-            st.session_state.authenticated = False
-            st.session_state.username = None
-            # trigger rerun
-            if hasattr(st, "experimental_rerun"):
-                try:
-                    st.experimental_rerun()
-                except Exception:
-                    st.experimental_set_query_params(_logout=int(time.time()))
-                    st.stop()
-            else:
+    st.sidebar.write(f"Logged in as **{st.session_state.username}**")
+    if st.sidebar.button("Logout"):
+        st.session_state.authenticated = False
+        st.session_state.username = None
+        if hasattr(st, "experimental_rerun"):
+            try:
+                st.experimental_rerun()
+            except Exception:
                 st.experimental_set_query_params(_logout=int(time.time()))
                 st.stop()
-    else:
-        st.sidebar.subheader("Login to access dashboard")
-        _user_in = st.sidebar.text_input("Username", value="")
-        _pass_in = st.sidebar.text_input("Password", type="password")
-        if st.sidebar.button("Login"):
-            if str(_user_in) == str(AUTH_USERNAME) and str(_pass_in) == str(AUTH_PASSWORD):
-                st.session_state.authenticated = True
-                st.session_state.username = _user_in
-                st.experimental_set_query_params(_login=int(time.time()))
-                st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.stop()
-            else:
-                st.sidebar.error("Invalid username or password")
+        else:
+            st.experimental_set_query_params(_logout=int(time.time()))
+            st.stop()
 
     # Sidebar: Refresh button (clears Streamlit caches and forces rerun)
     st.sidebar.markdown("---")
     if st.sidebar.button("Refresh data (clear cache)"):
         try:
             st.cache_data.clear()
+            st.cache_resource.clear()
         except Exception:
             pass
+        # change a query param to force a rerun if experimental_rerun isn't available
         if hasattr(st, "experimental_rerun"):
             try:
                 st.experimental_rerun()
@@ -377,10 +385,9 @@ def main():
             st.experimental_set_query_params(_refresh=int(time.time()))
             st.stop()
 
-    # stop early if not authenticated
+    # stop early if not authenticated (safety)
     if not st.session_state.get("authenticated"):
         st.sidebar.info("Please login with your credentials to view the dashboard.")
-        st.sidebar.caption("Provide auth credentials via st.secrets under [auth] for production.")
         return
 
     client = get_bq_client()
@@ -465,7 +472,13 @@ def main():
                 st.markdown("**Hourly distribution (selected period)**")
                 plot_hourly_activity(user_msgs, title=f"Hourly Activity for {user}")
                 with st.expander("Show raw messages (first 500)"):
-                    st.dataframe(user_msgs.head(500), width="stretch")
+                    # use data_editor so sorting in UI can be exported in the same order
+                    if not user_msgs.empty:
+                        edited = st.data_editor(user_msgs.head(500), disabled=True, use_container_width=True)
+                        csv_bytes = edited.to_csv(index=False).encode('utf-8')
+                        st.download_button("Download messages CSV (sorted view)", data=csv_bytes, file_name=f"{user}_messages.csv", mime="text/csv")
+                    else:
+                        st.info("No messages to show for this user.")
 
     else:
         st.header("Leaderboard View — Top Users by Total Interaction Minutes")
@@ -481,15 +494,17 @@ def main():
 
             leaderboard_display["rank"] = range(1, len(leaderboard_display) + 1)
             cols = ["rank", "user_identifier", "total_minutes", "percentage_of_total", "message_count", "avg_session_minutes", "first_message", "last_message"]
-            st.dataframe(leaderboard_display[cols], width="stretch")
+
+            # Use data_editor so we can capture the UI-sorted order for CSV download
+            edited_df = st.data_editor(leaderboard_display[cols], disabled=True, use_container_width=True)
 
             top_n = st.slider("Top N users to chart", min_value=5, max_value=100, value=10)
-            top_df = leaderboard_display.head(top_n)
+            top_df = edited_df.head(top_n)
             fig = px.bar(top_df, x="user_identifier", y="total_minutes", title=f"Top {top_n} Users by Total Minutes")
             st.plotly_chart(fig, width="stretch")
 
-            csv = leaderboard_display.to_csv(index=False)
-            st.download_button("Export Leaderboard CSV", csv, file_name="leaderboard_top_users.csv")
+            csv_bytes = edited_df.to_csv(index=False).encode('utf-8')
+            st.download_button("Export Leaderboard CSV (sorted view)", csv_bytes, file_name="leaderboard_top_users.csv", mime="text/csv")
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("Built for large datasets. Uses BigQuery sessionization and Streamlit caching for performance.")
