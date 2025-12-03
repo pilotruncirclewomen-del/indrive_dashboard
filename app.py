@@ -41,26 +41,39 @@ LEADERBOARD_LIMIT = 1000
 # UTIL: BigQuery client
 # ---------------------------
 @st.cache_resource
-def get_bq_client(credentials_path: str = CREDENTIALS_PATH) -> bigquery.Client:
-    """Create and cache a BigQuery client."""
-    if credentials_path and os.path.exists(credentials_path):
-        creds = service_account.Credentials.from_service_account_file(credentials_path)
-        client = bigquery.Client(credentials=creds, project=creds.project_id)
-    else:
-        client = bigquery.Client()
-    return client
+def get_bq_client() -> bigquery.Client:
+    """
+    Create and cache a BigQuery client.
 
-
-def table_ref() -> str:
-    return f"`{PROJECT_ID}.{DATASET}.{MESSAGES_TABLE}`"
-
-
-def _bq_storage_available() -> bool:
+    Priority:
+    1) Use st.secrets['gcp_service_account'] (Streamlit Cloud)
+    2) Fallback to Application Default Credentials (ADC)
+    """
+    # 1) Streamlit Cloud secrets (primary)
     try:
-        import google.cloud.bigquery_storage  # noqa: F401
-        return True
-    except Exception:
-        return False
+        if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+            creds_info = dict(st.secrets["gcp_service_account"])
+            creds = service_account.Credentials.from_service_account_info(creds_info)
+            project = creds_info.get("project_id") or creds.project_id or PROJECT_ID
+            return bigquery.Client(credentials=creds, project=project)
+    except Exception as e:
+        st.warning(f"Could not initialize BigQuery with st.secrets credentials: {e}")
+
+    # 2) Fallback to ADC (local environment or system credentials)
+    try:
+        env_project = (
+            os.environ.get("GOOGLE_CLOUD_PROJECT") or
+            os.environ.get("GCLOUD_PROJECT") or
+            PROJECT_ID
+        )
+        return bigquery.Client(project=env_project)
+    except Exception as e:
+        raise RuntimeError(
+            "Unable to create a BigQuery client.\n"
+            "Please ensure st.secrets['gcp_service_account'] exists OR "
+            "set GOOGLE_CLOUD_PROJECT and ADC credentials locally.\n"
+            f"Underlying error: {e}"
+        )
 
 # ---------------------------
 # Data access functions (no UI inside cached functions)
