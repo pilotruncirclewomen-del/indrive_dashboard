@@ -1,513 +1,391 @@
-"""
-Corrected Streamlit dashboard for BigQuery messages table.
-- Moved auth UI to main()
-- Fixed get_unique_user_count() (no UI, no syntax errors)
-- Added time import and robust rerun fallback
-- Replaced deprecated use_container_width with width="stretch"
-- Detects BigQuery Storage availability safely
-- Avoids caching functions that contain UI
-"""
-
+# streamlit_m_posts_dashboard.py
 import os
 import time
-from datetime import datetime, timedelta
-from typing import List, Tuple, Dict
+from typing import Tuple, Dict, List
+from datetime import datetime
 
 import pandas as pd
-import numpy as np
-import plotly.express as px
 import streamlit as st
-
 from google.cloud import bigquery
-from google.oauth2 import service_account
 from google.api_core.exceptions import GoogleAPIError
+from google.oauth2 import service_account
 
-# ---------------------------
-# CONFIG
-# ---------------------------
-PROJECT_ID = "pilot-run-turn-bq-integration"
-DATASET = "923141851055"
-MESSAGES_TABLE = "messages"
+st.set_page_config(page_title="M-posts Single-Table Dashboard", layout="wide")
 
-# Path to JSON credential file provided by user (use env or st.secrets in production)
-CREDENTIALS_PATH = "/Users/maysam/Desktop/AUSTIN-BIKEHSHARE-main/pilot-run-turn-bq-integration-6aef543e26a5.json"
+# --- CONFIG ---
+PROJECT_TABLE = "pilot-run-turn-bq-integration.923141851055.contacts"
+CACHE_TTL_SECONDS = 300
+NUM_M_POSTS = 6
 
-# Leaderboard cache TTL (seconds)
-LEADERBOARD_TTL = 3600  # 1 hour
-USERS_PAGE_SIZE = 100
-LEADERBOARD_LIMIT = 1000
+# --- SQL: extract one representative row per whatsapp_id with raw values ---
+QUERY = f"""
+WITH raw AS (
+  SELECT
+    JSON_EXTRACT_SCALAR(details, '$.whatsapp_id') AS whatsapp_id,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.m1post'), '') AS m1_raw,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.m2post'), '') AS m2_raw,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.m3post'), '') AS m3_raw,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.m4post'), '') AS m4_raw,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.m5post'), '') AS m5_raw,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.m6post'), '') AS m6_raw,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.cohort_no'), '') AS cohort_no,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.indrive_module_1_complete'), '') AS indrive_module_1_complete,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.indrive_module_2_complete'), '') AS indrive_module_2_complete,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.indrive_module_3_complete'), '') AS indrive_module_3_complete,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.indrive_module_4_complete'), '') AS indrive_module_4_complete,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.indrive_module_5_complete'), '') AS indrive_module_5_complete,
+    COALESCE(JSON_EXTRACT_SCALAR(details, '$.indrive_module_6_complete'), '') AS indrive_module_6_complete
+  FROM `{PROJECT_TABLE}`
+  WHERE JSON_EXTRACT_SCALAR(details, '$.whatsapp_id') IS NOT NULL
+    AND JSON_EXTRACT_SCALAR(details, '$.whatsapp_id') != ''
+),
+agg AS (
+  SELECT
+    whatsapp_id,
+    MAX(m1_raw) AS m1_value,
+    MAX(m2_raw) AS m2_value,
+    MAX(m3_raw) AS m3_value,
+    MAX(m4_raw) AS m4_value,
+    MAX(m5_raw) AS m5_value,
+    MAX(m6_raw) AS m6_value,
+    MAX(cohort_no) AS cohort_no,
+    MAX(indrive_module_1_complete) AS indrive_module_1_value,
+    MAX(indrive_module_2_complete) AS indrive_module_2_value,
+    MAX(indrive_module_3_complete) AS indrive_module_3_value,
+    MAX(indrive_module_4_complete) AS indrive_module_4_value,
+    MAX(indrive_module_5_complete) AS indrive_module_5_value,
+    MAX(indrive_module_6_complete) AS indrive_module_6_value
+  FROM raw
+  GROUP BY whatsapp_id
+)
+SELECT * FROM agg
+ORDER BY whatsapp_id;
+"""
 
-# ---------------------------
-# UTIL: BigQuery client
-# ---------------------------
-@st.cache_resource
-def get_bq_client() -> bigquery.Client:
+# --- BigQuery loader (cached) ---
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_data_from_bq(query: str) -> Tuple[pd.DataFrame, Dict[str, any]]:
     """
-    Create and cache a BigQuery client.
-
-    Priority:
-    1) Use st.secrets['gcp_service_account'] (Streamlit Cloud)
-    2) Fallback to Application Default Credentials (ADC)
+    Loads data from BigQuery using either credentials in Streamlit secrets or
+    GOOGLE_APPLICATION_CREDENTIALS environment variable.
+    Uses BigQuery Storage API if available (faster), otherwise falls back to REST.
+    Returns dataframe and some lightweight metadata.
     """
-    # 1) Streamlit Cloud secrets (primary)
-    try:
-        if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
-            creds_info = dict(st.secrets["gcp_service_account"])
-            creds = service_account.Credentials.from_service_account_info(creds_info)
-            project = creds_info.get("project_id") or creds.project_id or PROJECT_ID
-            return bigquery.Client(credentials=creds, project=project)
-    except Exception as e:
-        st.warning(f"Could not initialize BigQuery with st.secrets credentials: {e}")
-
-    # 2) Fallback to ADC (local environment or system credentials)
-    try:
-        env_project = (
-            os.environ.get("GOOGLE_CLOUD_PROJECT") or
-            os.environ.get("GCLOUD_PROJECT") or
-            PROJECT_ID
+    # Build client
+    client = None
+    if "gcp_service_account" in st.secrets:
+        creds_info = dict(st.secrets["gcp_service_account"])
+        credentials = service_account.Credentials.from_service_account_info(creds_info)
+        client = bigquery.Client(
+            credentials=credentials,
+            project=creds_info.get("project_id"),
         )
-        return bigquery.Client(project=env_project)
-    except Exception as e:
-        raise RuntimeError(
-            "Unable to create a BigQuery client.\n"
-            "Please ensure st.secrets['gcp_service_account'] exists OR "
-            "set GOOGLE_CLOUD_PROJECT and ADC credentials locally.\n"
-            f"Underlying error: {e}"
-        )
+    else:
+        cred = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if not cred:
+            st.error(
+                "Configure 'gcp_service_account' in Streamlit secrets "
+                "or set GOOGLE_APPLICATION_CREDENTIALS locally."
+            )
+            st.stop()
+        client = bigquery.Client()
 
-# ---------------------------
-# Data access functions (no UI inside cached functions)
-# ---------------------------
-@st.cache_data(ttl=300)
-def get_unique_user_count_bq() -> int:
-    """Query distinct users using addressees array (fallback to raw_body if needed)."""
-    client = get_bq_client()
-    # Primary: use addressees array
+    job = client.query(query)
+
+    # metadata placeholder
+    metadata = {
+        "job_id": None,
+        "total_bytes_processed": None,
+        "location": None,
+        "queried_at": None,
+    }
+
+    # Detect availability of BigQuery Storage client
     try:
-        q = f"""
-        SELECT COUNT(DISTINCT JSON_EXTRACT_SCALAR(addressees, '$[0]')) AS cnt
-        FROM {table_ref()}
-        WHERE addressees IS NOT NULL
-        """
-        row = list(client.query(q).result())[0]
-        return int(row.cnt) if row and row.cnt is not None else 0
+        import google.cloud.bigquery_storage  # noqa: F401
+        use_bq_storage = True
     except Exception:
-        # Fallback: try JSON in raw_body
-        try:
-            q2 = f"SELECT COUNT(DISTINCT JSON_EXTRACT_SCALAR(raw_body, '$.wa_id')) AS cnt FROM {table_ref()}"
-            row2 = list(client.query(q2).result())[0]
-            return int(row2.cnt) if row2 and row2.cnt is not None else 0
-        except Exception:
-            return 0
+        use_bq_storage = False
 
+    # Attempt to fetch to dataframe
+    try:
+        df = job.result().to_dataframe(create_bqstorage_client=use_bq_storage)
+    except GoogleAPIError as e:
+        # BigQuery Storage may be unavailable or error; fall back to REST
+        st.warning(f"BigQuery Storage API unavailable or error, falling back to REST: {e}")
+        df = job.result().to_dataframe(create_bqstorage_client=False)
+    except Exception as e:
+        st.error(f"Failed to fetch results from BigQuery: {e}")
+        st.stop()
 
-@st.cache_data(ttl=300)
-def list_users_page(page: int = 0, page_size: int = USERS_PAGE_SIZE, order_by_engagement: bool = False) -> pd.DataFrame:
-    client = get_bq_client()
-    offset = page * page_size
-    if order_by_engagement:
-        q = f"""
-        SELECT user_phone, message_count FROM (
-          SELECT
-            JSON_EXTRACT_SCALAR(addressees, '$[0]') AS user_phone,
-            COUNT(1) AS message_count
-          FROM {table_ref()}
-          WHERE JSON_EXTRACT_SCALAR(addressees, '$[0]') IS NOT NULL
-          GROUP BY user_phone
-        )
-        ORDER BY message_count DESC
-        LIMIT {page_size} OFFSET {offset}
-        """
-    else:
-        q = f"""
-        SELECT user_phone FROM (
-          SELECT DISTINCT JSON_EXTRACT_SCALAR(addressees, '$[0]') AS user_phone
-          FROM {table_ref()}
-        )
-        WHERE user_phone IS NOT NULL
-        ORDER BY user_phone
-        LIMIT {page_size} OFFSET {offset}
-        """
-    df = client.query(q).result().to_dataframe(create_bqstorage_client=_bq_storage_available())
-    if 'user_phone' in df.columns:
-        df = df.rename(columns={'user_phone': 'user_identifier'})
-    return df
+    # Populate metadata where possible
+    try:
+        metadata["job_id"] = getattr(job, "job_id", None) or job.job_id
+        total_bytes = getattr(job, "total_bytes_processed", None)
+        if total_bytes is None:
+            total_bytes = job._properties.get("statistics", {}).get("totalBytesProcessed")
+        metadata["total_bytes_processed"] = total_bytes
+        metadata["location"] = getattr(job, "location", None) or job._properties.get("jobReference", {}).get("location")
+    except Exception:
+        pass
 
+    metadata["queried_at"] = datetime.utcnow().isoformat() + "Z"
+    return df, metadata
 
-@st.cache_data(ttl=300)
-def get_user_messages(user_identifier: str, start: datetime = None, end: datetime = None, limit: int = 100000) -> pd.DataFrame:
-    client = get_bq_client()
-    time_filter = ""
-    if start and end:
-        time_filter = (
-            f"AND COALESCE(SAFE_CAST(inserted_at AS TIMESTAMP), SAFE_CAST(JSON_EXTRACT_SCALAR(raw_body, '$.timestamp') AS TIMESTAMP)) "
-            f"BETWEEN TIMESTAMP('{start.isoformat()}') AND TIMESTAMP('{end.isoformat()}')"
-        )
-    q = f"""
-    SELECT
-      JSON_EXTRACT_SCALAR(addressees, '$[0]') AS user_identifier,
-      uuid AS message_uuid,
-      message_type,
-      COALESCE(rendered_content, JSON_EXTRACT_SCALAR(raw_body, '$.text.body'), raw_body) AS message_text,
-      COALESCE(SAFE_CAST(inserted_at AS TIMESTAMP), SAFE_CAST(JSON_EXTRACT_SCALAR(raw_body, '$.timestamp') AS TIMESTAMP)) AS timestamp,
-      direction
-    FROM {table_ref()}
-    WHERE JSON_EXTRACT_SCALAR(addressees, '$[0]') = @user_identifier
-      AND COALESCE(SAFE_CAST(inserted_at AS TIMESTAMP), SAFE_CAST(JSON_EXTRACT_SCALAR(raw_body, '$.timestamp') AS TIMESTAMP)) IS NOT NULL
-      {time_filter}
-    ORDER BY timestamp ASC
-    LIMIT {limit}
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("user_identifier", "STRING", user_identifier)]
-    )
-    job = client.query(q, job_config=job_config)
-    df = job.result().to_dataframe(create_bqstorage_client=_bq_storage_available())
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-    return df
-
-
-@st.cache_data(ttl=LEADERBOARD_TTL)
-def precompute_leaderboard(limit: int = LEADERBOARD_LIMIT) -> pd.DataFrame:
-    client = get_bq_client()
-    q = f"""
-    WITH messages_parsed AS (
-      SELECT
-        JSON_EXTRACT_SCALAR(addressees, '$[0]') AS user_identifier,
-        COALESCE(SAFE_CAST(inserted_at AS TIMESTAMP), SAFE_CAST(JSON_EXTRACT_SCALAR(raw_body, '$.timestamp') AS TIMESTAMP)) AS ts
-      FROM {table_ref()}
-      WHERE JSON_EXTRACT_SCALAR(addressees, '$[0]') IS NOT NULL
-        AND COALESCE(SAFE_CAST(inserted_at AS TIMESTAMP), SAFE_CAST(JSON_EXTRACT_SCALAR(raw_body, '$.timestamp') AS TIMESTAMP)) IS NOT NULL
-    ), numbered AS (
-      SELECT user_identifier, ts, LAG(ts) OVER (PARTITION BY user_identifier ORDER BY ts) AS prev_ts
-      FROM messages_parsed
-    ), sessions AS (
-      SELECT user_identifier, ts, prev_ts,
-             IF(prev_ts IS NULL OR TIMESTAMP_DIFF(ts, prev_ts, MINUTE) > 30, 1, 0) AS is_new_session
-      FROM numbered
-    ), grouped AS (
-      SELECT user_identifier, ts,
-             SUM(is_new_session) OVER (PARTITION BY user_identifier ORDER BY ts) AS session_id
-      FROM sessions
-    ), bounds AS (
-      SELECT user_identifier, session_id, MIN(ts) AS session_start, MAX(ts) AS session_end, COUNT(1) AS messages_in_session
-      FROM grouped
-      GROUP BY user_identifier, session_id
-    )
-    SELECT
-      user_identifier,
-      SUM(TIMESTAMP_DIFF(session_end, session_start, SECOND) / 60.0) AS total_minutes,
-      SUM(messages_in_session) AS message_count,
-      MIN(session_start) AS first_message,
-      MAX(session_end) AS last_message,
-      AVG(TIMESTAMP_DIFF(session_end, session_start, SECOND) / 60.0) AS avg_session_minutes
-    FROM bounds
-    WHERE user_identifier IS NOT NULL
-    GROUP BY user_identifier
-    ORDER BY total_minutes DESC
-    LIMIT {limit}
-    """
-    df = client.query(q).result().to_dataframe(create_bqstorage_client=_bq_storage_available())
-    if not df.empty:
-        df["percentage_of_total"] = df["total_minutes"] / df["total_minutes"].sum() * 100
-        df["first_message"] = pd.to_datetime(df["first_message"])
-        df["last_message"] = pd.to_datetime(df["last_message"])
-    return df
-
-# ---------------------------
-# Metrics calculations (pandas)
-# ---------------------------
-
-def _minutes_to_hm(minutes: int) -> str:
-    hours = minutes // 60
-    mins = minutes % 60
-    return f"{hours:02d}:{mins:02d}"
-
-
-def compute_user_metrics(df: pd.DataFrame, analysis_end: datetime = None) -> dict:
-    if df is None or df.empty:
-        return {}
-    df = df.copy().sort_values("timestamp")
-
-    first_ts = df.iloc[0]["timestamp"]
-    last_ts = df.iloc[-1]["timestamp"]
-
-    # Default analysis window: most recent full day (24 hours before last message)
-    if analysis_end is None:
-        last_msg = pd.to_datetime(df["timestamp"].max())
-        analysis_end = (last_msg.normalize() + pd.Timedelta(days=1))
-    analysis_start = analysis_end - pd.Timedelta(days=1)
-
-    window_df = df[(df["timestamp"] >= analysis_start) & (df["timestamp"] < analysis_end)]
-
-    def compute_sessions_minutes(series_ts: pd.Series) -> float:
-        if series_ts.empty:
+# --- Helper: coerce strings to numeric for mpost values (for sum) ---
+def parse_numeric_value(s: str) -> float:
+    """Try to convert string to float. Treat '', 'null', 'None' as 0. Non-numeric -> 0."""
+    if s is None:
+        return 0.0
+    s2 = str(s).strip()
+    if s2.lower() in ("", "null", "none"):
+        return 0.0
+    try:
+        return float(s2)
+    except Exception:
+        # try common boolean -> numeric mapping
+        if s2.lower() in ("true", "t", "yes", "y"):
+            return 1.0
+        if s2.lower() in ("false", "f", "no", "n"):
             return 0.0
-        times = pd.to_datetime(series_ts).sort_values()
-        diffs = times.diff().dt.total_seconds().fillna(0)
-        session_breaks = diffs > 1800
-        session_ids = session_breaks.cumsum()
-        minutes_total = 0.0
-        for _, group in times.groupby(session_ids):
-            minutes_total += (group.max() - group.min()).total_seconds() / 60.0
-        return minutes_total
+        return 0.0
 
-    daily_minutes = compute_sessions_minutes(window_df["timestamp"]) if not window_df.empty else 0.0
+# --- Business rule B: completed if mX_value IN {'0','1','2'} (strings) ---
+COMPLETED_VALUES = {"0", "1", "2"}
 
-    hist_source = window_df if not window_df.empty else df
-    if hist_source.empty:
-        peak_hour = None
-        peak_count = 0
+# --- Prepare dataframe from raw BQ output ---
+def prepare_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame(
+            columns=["whatsapp_id", "cohort_no"] +
+                    [f"m{i}_value" for i in range(1, NUM_M_POSTS + 1)] +
+                    ["completed_count", "sum_mposts_value"] +
+                    [f"indrive_module_{i}_value" for i in range(1, NUM_M_POSTS + 1)] +
+                    ["sum_indrive"]
+        )
+
+    df = df_raw.copy()
+
+    # normalize columns existence
+    for i in range(1, NUM_M_POSTS + 1):
+        col = f"m{i}_value"
+        if col not in df.columns:
+            df[col] = ""
+        ind_col = f"indrive_module_{i}_value"
+        if ind_col not in df.columns:
+            df[ind_col] = ""
+
+    # ensure whatsapp_id and cohort_no exist
+    if "whatsapp_id" not in df.columns:
+        df["whatsapp_id"] = ""
+    df["whatsapp_id"] = df["whatsapp_id"].astype(str).str.strip()
+    df["cohort_no"] = df.get("cohort_no", "").astype(str).fillna("").str.strip()
+
+    # Completed flag per module according to rule B
+    for i in range(1, NUM_M_POSTS + 1):
+        col = f"m{i}_value"
+        df[f"m{i}_completed_flag"] = df[col].astype(str).str.strip().apply(lambda x: 1 if x in COMPLETED_VALUES else 0)
+
+    # completed_count = count of modules with completed_flag == 1
+    completed_cols = [f"m{i}_completed_flag" for i in range(1, NUM_M_POSTS + 1)]
+    if completed_cols:
+        df["completed_count"] = df[completed_cols].sum(axis=1).astype(int)
     else:
-        hist = hist_source["timestamp"].dt.hour.value_counts().reindex(range(24), fill_value=0)
-        peak_hour = int(hist.idxmax())
-        peak_count = int(hist.max())
+        df["completed_count"] = 0
 
-    # Highest individual engagement sliding 24-hour window
-    timestamps = pd.to_datetime(df["timestamp"]).sort_values().reset_index(drop=True)
-    max_minutes = 0.0
-    max_start = None
-    if not timestamps.empty:
-        for i in range(len(timestamps)):
-            start_ts = timestamps[i]
-            window_end_ts = start_ts + pd.Timedelta(days=1)
-            window_slice = timestamps[(timestamps >= start_ts) & (timestamps <= window_end_ts)]
-            minutes = compute_sessions_minutes(window_slice)
-            if minutes > max_minutes:
-                max_minutes = minutes
-                max_start = start_ts
+    # sum_mposts_value = numeric sum of m1..m6 values (coerced)
+    numeric_cols_values = []
+    for i in range(1, NUM_M_POSTS + 1):
+        col = f"m{i}_value"
+        num_col = f"m{i}_num_value"
+        df[num_col] = df[col].apply(parse_numeric_value).astype(float)
+        numeric_cols_values.append(num_col)
+    df["sum_mposts_value"] = df[numeric_cols_values].sum(axis=1).astype(float)
 
-    highest_window = {
-        "total_minutes": int(round(max_minutes)),
-        "start": pd.to_datetime(max_start) if max_start is not None else None,
-        "end": (pd.to_datetime(max_start) + pd.Timedelta(days=1)) if max_start is not None else None,
-    }
+    # Parse indrive columns to numeric (handle '1','0','true','false')
+    indrive_num_cols = []
+    for i in range(1, NUM_M_POSTS + 1):
+        ind_col = f"indrive_module_{i}_value"
+        ind_num_col = f"indrive_module_{i}_num"
+        # normalize null-ish
+        df[ind_col] = df[ind_col].fillna("").astype(str).str.strip()
+        def parse_indrive(x: str) -> int:
+            if str(x).strip().lower() in ("", "null", "none"):
+                return 0
+            if str(x).strip().lower() in ("1", "true", "t", "yes", "y"):
+                return 1
+            if str(x).strip().lower() in ("0", "false", "f", "no", "n"):
+                return 0
+            # try numeric
+            try:
+                return int(float(x))
+            except Exception:
+                return 0
+        df[ind_num_col] = df[ind_col].apply(parse_indrive).astype(int)
+        indrive_num_cols.append(ind_num_col)
 
-    return {
-        "first_interaction": pd.to_datetime(first_ts),
-        "last_interaction": pd.to_datetime(last_ts),
-        "daily_minutes": int(round(daily_minutes)),
-        "daily_minutes_hm": _minutes_to_hm(int(round(daily_minutes))),
-        "peak_hour": peak_hour,
-        "peak_count": peak_count,
-        "highest_window": highest_window,
-    }
+    df["sum_indrive"] = df[indrive_num_cols].sum(axis=1).astype(int) if indrive_num_cols else 0
 
-# ---------------------------
-# Visualizations
-# ---------------------------
+    # Final tidy columns
+    keep_cols = ["whatsapp_id", "cohort_no"] \
+                + [f"m{i}_value" for i in range(1, NUM_M_POSTS + 1)] \
+                + ["completed_count", "sum_mposts_value"] \
+                + [f"indrive_module_{i}_value" for i in range(1, NUM_M_POSTS + 1)] \
+                + ["sum_indrive"]
+    # Ensure all exist
+    for c in keep_cols:
+        if c not in df.columns:
+            df[c] = "" if c.endswith("_value") or c == "cohort_no" else 0
+    df_final = df[keep_cols].drop_duplicates(subset=["whatsapp_id"]).reset_index(drop=True)
+    return df_final
 
-def plot_hourly_activity(df: pd.DataFrame, title: str = "Hourly Activity"):
-    if df is None or df.empty:
-        st.info("No messages for the selected period/user.")
-        return
-    df = df.copy()
-    df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
-    hourly = df.groupby("hour").size().reindex(range(24), fill_value=0).reset_index()
-    hourly.columns = ["hour", "count"]
-    fig = px.line(hourly, x="hour", y="count", markers=True, title=title)
-    fig.update_xaxes(tickmode="linear")
-    st.plotly_chart(fig, width="stretch")
+# --- UI: Sidebar (all filters) ---
+st.sidebar.title("Filters & Controls")
+st.sidebar.markdown("**Filter Out Those Who Have Completed Modules Post Quizez**")
 
+# exact completed count filter
+exact_choices = [str(i) for i in range(1, NUM_M_POSTS + 1)]
+selected_exact = st.sidebar.multiselect("Show users who completed exactly:", options=exact_choices, default=[])
 
-def plot_heatmap(df: pd.DataFrame, title: str = "Activity Heatmap"):
-    if df is None or df.empty:
-        return
-    df = df.copy()
-    df["hour"] = pd.to_datetime(df["timestamp"]).dt.hour
-    df["date"] = pd.to_datetime(df["timestamp"]).dt.date
-    pivot = df.groupby(["date", "hour"]).size().unstack(fill_value=0)
-    pivot = pivot.sort_index()
-    fig = px.imshow(pivot.T.values, aspect="auto", labels=dict(x="Date", y="Hour", color="Messages"), x=pivot.index.astype(str), y=pivot.columns)
-    fig.update_layout(title=title)
-    st.plotly_chart(fig, width="stretch")
+# toggle show only completed all modules
+only_all_completed = st.sidebar.checkbox("Show only users who completed all 6 modules", value=False)
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
+# cohort filter placeholder (populated after data load)
+cohort_select = st.sidebar.multiselect("Filter by cohort_no (leave empty for all)", options=[], default=[])
 
-def main():
-    # single set_page_config at top-level already applied; don't reapply here
-    st.title("Messages Analytics Dashboard")
-    st.markdown("Analyze user engagement patterns from the BigQuery `messages` table.")
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Top Leader Board Ranking Based On Modules**")
+st.sidebar.write("You can use sum_mposts_value (numeric sum of m1..m6) and sum_indrive to rank/sort in the table.")
 
-    # --- Auth UI (moved out of cached functions) ---
-    auth_secrets = st.secrets.get("auth", {}) if hasattr(st, "secrets") else {}
-    AUTH_USERNAME = auth_secrets.get("username", "Admin")
-    AUTH_PASSWORD = auth_secrets.get("password", "admin123@#")
+# numeric filters for ranking ranges
+min_sum_mposts_val = st.sidebar.number_input("Min sum of m-post values", value=0.0, format="%.2f")
+max_sum_mposts_val = st.sidebar.number_input("Max sum of m-post values", value=1_000_000.0, format="%.2f")
+min_sum_indrive = st.sidebar.number_input("Min sum_indrive", value=0, step=1)
+max_sum_indrive = st.sidebar.number_input("Max sum_indrive", value=NUM_M_POSTS, step=1)
 
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-        st.session_state.username = None
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Filter by indrive module status (require selected modules = chosen value)**")
+indrive_options = [f"indrive_module_{i}_value" for i in range(1, NUM_M_POSTS + 1)]
+selected_indrive_modules = st.sidebar.multiselect("Select indrive modules (AND semantics):", options=indrive_options, default=[])
+indrive_value_choice = st.sidebar.selectbox("Require selected indrive modules to be:", options=["1", "0"], index=0)
 
-    with st.sidebar:
-        st.header("Account")
-        if st.session_state.get("authenticated"):
-            st.write(f"Logged in as **{st.session_state.get('username')}**")
-            if st.button("Logout"):
-                st.session_state.authenticated = False
-                st.session_state.username = None
-                # trigger rerun
-                try:
-                    if hasattr(st, "experimental_rerun"):
-                        st.experimental_rerun()
-                    else:
-                        st.experimental_set_query_params(_logout=int(time.time()))
-                        st.stop()
-                except Exception:
-                    st.experimental_set_query_params(_logout=int(time.time()))
-                    st.stop()
-        else:
-            st.subheader("Login to access dashboard")
-            _user_in = st.text_input("Username", value="")
-            _pass_in = st.text_input("Password", type="password")
-            if st.button("Login"):
-                if str(_user_in) == str(AUTH_USERNAME) and str(_pass_in) == str(AUTH_PASSWORD):
-                    st.session_state.authenticated = True
-                    st.session_state.username = _user_in
-                    st.success("Logged in successfully")
-                    try:
-                        if hasattr(st, "experimental_rerun"):
-                            st.experimental_rerun()
-                        else:
-                            st.experimental_set_query_params(_login=int(time.time()))
-                            st.stop()
-                    except Exception:
-                        st.experimental_set_query_params(_login=int(time.time()))
-                        st.stop()
-                else:
-                    st.error("Invalid username or password")
+st.sidebar.markdown("---")
 
-    if not st.session_state.get("authenticated"):
-        st.sidebar.info("Please login with your credentials to view the dashboard.")
-        st.sidebar.caption("Provide auth credentials via st.secrets under [auth] for production.")
-        return
+# Robust Refresh button: clear cached data and trigger a rerun (works across Streamlit versions)
+if st.sidebar.button("Refresh data (clear cache)"):
+    try:
+        st.cache_data.clear()
+    except Exception:
+        # Some Streamlit versions may behave differently; ignore errors
+        pass
 
-    client = get_bq_client()
-
-    # Header summary
-    with st.container():
-        col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
+    # Use experimental_rerun() if present; otherwise change query params to force rerun
+    if hasattr(st, "experimental_rerun"):
         try:
-            total_users = get_unique_user_count_bq()
-        except Exception as e:
-            total_users = "Unknown"
-            st.error(f"Error fetching unique user count: {e}")
-
-        col1.metric("Unique Users", f"{total_users:,}" if isinstance(total_users, int) else total_users)
-        try:
-            q = f"SELECT COUNT(1) as cnt FROM {table_ref()}"
-            cnt = list(client.query(q).result())[0].cnt
-            col2.metric("Total Records", f"{int(cnt):,}")
-        except Exception:
-            col2.metric("Total Records", "Unknown")
-        col3.metric("Data Source", f"BigQuery: {DATASET}.{MESSAGES_TABLE}")
-        col4.metric("Last Refresh", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"))
-
-    # Sidebar controls
-    st.sidebar.header("Filters & Controls")
-    mode = st.sidebar.selectbox("Display Mode", ["Single User View", "Leaderboard View"]) 
-    start_date = st.sidebar.date_input("Start date (optional)", value=None)
-    end_date = st.sidebar.date_input("End date (optional)", value=None)
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Select User / Phone Number")
-    page = st.sidebar.number_input("Users page", min_value=0, value=0, step=1)
-    order_by_eng = st.sidebar.checkbox("Order users by engagement", value=False)
-    users_df = list_users_page(page=page, page_size=USERS_PAGE_SIZE, order_by_engagement=order_by_eng)
-    users_list = users_df.get("user_identifier", pd.Series(dtype=str)).dropna().astype(str).tolist()
-    users_list_display = ["View All"] + users_list
-    selected_users = st.sidebar.multiselect("Choose user(s)", options=users_list_display, default=[users_list_display[0]])
-
-    # Refresh control
-    st.sidebar.markdown("---")
-    if st.sidebar.button("Refresh data (clear cache)"):
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
-        # trigger rerun
-        try:
-            if hasattr(st, "experimental_rerun"):
-                st.experimental_rerun()
-            else:
-                st.experimental_set_query_params(_refresh=int(time.time()))
-                st.stop()
+            st.experimental_rerun()
         except Exception:
             st.experimental_set_query_params(_refresh=int(time.time()))
             st.stop()
-
-    # Main layout
-    if mode == "Single User View":
-        st.header("Single User View")
-        if not selected_users or "View All" in selected_users:
-            st.info("Please select a specific user from the sidebar (unselect 'View All') to see user metrics.")
-        else:
-            for user in selected_users:
-                st.subheader(f"User: {user}")
-                s = None
-                e = None
-                if start_date and end_date:
-                    s = datetime.combine(start_date, datetime.min.time())
-                    e = datetime.combine(end_date, datetime.max.time())
-                elif end_date and not start_date:
-                    e = datetime.combine(end_date, datetime.max.time())
-                    s = e - timedelta(days=1)
-                elif start_date and not end_date:
-                    s = datetime.combine(start_date, datetime.min.time())
-                    e = s + timedelta(days=1)
-
-                user_msgs = get_user_messages(user, start=s, end=e)
-                metrics = compute_user_metrics(user_msgs, analysis_end=e)
-
-                col1, col2, col3, col4 = st.columns(4)
-                if metrics:
-                    col1.metric("First Chat Date", metrics["first_interaction"].strftime("%Y-%m-%d %H:%M:%S"))
-                    col2.metric("24-hr Minutes", f"{metrics['daily_minutes']} min", metrics['daily_minutes_hm'])
-                    if metrics['peak_hour'] is not None:
-                        peak_label = f"{metrics['peak_hour']:02d}:00 - {metrics['peak_hour']:02d}:59"
-                        col3.metric("Peak Hour", peak_label, f"{metrics['peak_count']} msgs")
-                    else:
-                        col3.metric("Peak Hour", "N/A")
-                    if metrics['highest_window']['start'] is not None:
-                        hw = metrics['highest_window']
-                        col4.metric("Top 24-hr Window", f"{hw['total_minutes']} min", f"{hw['start'].date()} to {hw['end'].date()}")
-                else:
-                    col1.info("No data for user")
-
-                st.markdown("**Hourly distribution (selected period)**")
-                plot_hourly_activity(user_msgs, title=f"Hourly Activity for {user}")
-                with st.expander("Show raw messages (first 500)"):
-                    st.dataframe(user_msgs.head(500), width="stretch")
-
     else:
-        st.header("Leaderboard View — Top Users by Total Interaction Minutes")
-        leaderboard = precompute_leaderboard(limit=LEADERBOARD_LIMIT)
-        if leaderboard.empty:
-            st.info("Leaderboard currently empty — no data available")
+        st.experimental_set_query_params(_refresh=int(time.time()))
+        st.stop()
+
+# --- Load and prepare data ---
+with st.spinner("Loading data from BigQuery..."):
+    raw_df, meta = load_data_from_bq(QUERY)
+
+df = prepare_dataframe(raw_df)
+
+# populate cohort select options now that df is ready
+unique_cohorts = sorted([c for c in df["cohort_no"].unique() if str(c).strip() not in ("", "None", "null")])
+if unique_cohorts:
+    # if user hasn't set cohort_select yet, keep it empty by default
+    cohort_select = st.sidebar.multiselect("Filter by cohort_no (leave empty for all)", options=unique_cohorts, default=cohort_select)
+
+# --- Apply filters (in this order) ---
+mask = pd.Series(True, index=df.index)
+
+# cohort filter
+if cohort_select:
+    mask &= df["cohort_no"].isin(cohort_select)
+
+# exact completed count filter
+if selected_exact:
+    desired = set(int(x) for x in selected_exact)
+    mask &= df["completed_count"].isin(desired)
+
+# only all completed toggle (overrides/combines with above, keep AND semantics)
+if only_all_completed:
+    mask &= df["completed_count"] == NUM_M_POSTS
+
+# sum_mposts_value numeric range
+mask &= df["sum_mposts_value"].between(float(min_sum_mposts_val), float(max_sum_mposts_val))
+
+# sum_indrive numeric range
+mask &= df["sum_indrive"].between(int(min_sum_indrive), int(max_sum_indrive))
+
+# indrive module filters (AND): require selected indrive modules to equal chosen value
+if selected_indrive_modules:
+    # map indrive_value_choice to int (0 or 1)
+    try:
+        required_val = int(indrive_value_choice)
+    except Exception:
+        required_val = 1 if str(indrive_value_choice).lower() in ("1", "true", "yes") else 0
+    for col in selected_indrive_modules:
+        # col is like indrive_module_1_value -> we compare to parsed numeric column created earlier?
+        num_col = col.replace("_value", "_num")  # indrive_module_1_num
+        if num_col in df.columns:
+            mask &= df[num_col] == required_val
         else:
-            leaderboard_display = leaderboard.copy()
-            leaderboard_display["total_minutes"] = leaderboard_display["total_minutes"].round().astype(int)
-            leaderboard_display["percentage_of_total"] = leaderboard_display["percentage_of_total"].round(2)
-            leaderboard_display["first_message"] = pd.to_datetime(leaderboard_display["first_message"]).dt.strftime("%Y-%m-%d %H:%M:%S")
-            leaderboard_display["last_message"] = pd.to_datetime(leaderboard_display["last_message"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+            # For safety, try to compute on-the-fly:
+            def parse_indrive_val(x):
+                if str(x).strip().lower() in ("", "null", "none"):
+                    return 0
+                if str(x).strip().lower() in ("1", "true", "t", "yes", "y"):
+                    return 1
+                if str(x).strip().lower() in ("0", "false", "f", "no", "n"):
+                    return 0
+                try:
+                    return int(float(x))
+                except Exception:
+                    return 0
+            mask &= df[col].apply(parse_indrive_val) == required_val
 
-            leaderboard_display["rank"] = range(1, len(leaderboard_display) + 1)
-            cols = ["rank", "user_identifier", "total_minutes", "percentage_of_total", "message_count", "avg_session_minutes", "first_message", "last_message"]
-            st.dataframe(leaderboard_display[cols], width="stretch")
+filtered = df.loc[mask].copy().reset_index(drop=True)
 
-            top_n = st.slider("Top N users to chart", min_value=5, max_value=100, value=10)
-            top_df = leaderboard_display.head(top_n)
-            fig = px.bar(top_df, x="user_identifier", y="total_minutes", title=f"Top {top_n} Users by Total Minutes")
-            st.plotly_chart(fig, width="stretch")
+# --- Add indrive_num columns into filtered for display sorting if not present ---
+for i in range(1, NUM_M_POSTS + 1):
+    num_col = f"indrive_module_{i}_num"
+    val_col = f"indrive_module_{i}_value"
+    if num_col not in filtered.columns and val_col in filtered.columns:
+        # create numeric view column
+        filtered[num_col] = filtered[val_col].apply(lambda x: 1 if str(x).strip().lower() in ("1", "true", "yes", "y") else 0)
 
-            csv = leaderboard_display.to_csv(index=False)
-            st.download_button("Export Leaderboard CSV", csv, file_name="leaderboard_top_users.csv")
+# --- Build display columns and show one table only ---
+display_cols = [
+    "whatsapp_id",
+    "cohort_no",
+] + [f"m{i}_value" for i in range(1, NUM_M_POSTS + 1)] + [
+    "completed_count",
+    "sum_mposts_value",
+] + [f"indrive_module_{i}_value" for i in range(1, NUM_M_POSTS + 1)] + [
+    "sum_indrive"
+]
 
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("Built for large datasets. Uses BigQuery sessionization and Streamlit caching for performance.")
+display_cols = [c for c in display_cols if c in filtered.columns]
 
+st.title("M-posts — Single Table Dashboard")
+st.markdown("**Table shows unique WhatsApp IDs and supports all requested filters.**")
+st.write(f"Query run at: {meta.get('queried_at','n/a')} — rows after filter: {len(filtered):,}")
 
-if __name__ == '__main__':
-    main()
+# Show table (single view). Users can sort columns via the Streamlit dataframe UI.
+# use width='stretch' to replace deprecated use_container_width=True
+st.dataframe(filtered[display_cols], width="stretch", height=700)
+
+# CSV download
+@st.cache_data
+def to_csv_bytes(df_: pd.DataFrame) -> bytes:
+    return df_.to_csv(index=False).encode("utf-8")
+
+csv_bytes = to_csv_bytes(filtered[display_cols])
+st.download_button("Download filtered table as CSV", data=csv_bytes, file_name="m_posts_single_table_filtered.csv", mime="text/csv")
