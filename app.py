@@ -421,6 +421,15 @@ def render_contacts_modules_page():
     post_filter_mode = st.sidebar.radio("Filter post-quiz completed by", options=["All", "Exact", "At least"], index=0, key="post_mode")
     post_filter_n = st.sidebar.slider("Post quizzes completed (N)", min_value=0, max_value=NUM_MODULES, value=0, key="post_n")
 
+    # NEW: Indrive module completion filter (AND semantics: require all selected modules to be completed)
+    # This is the filter you requested: let user pick which indrive modules to require completion for.
+    indrive_options = indrive_fields  # names like 'indrive_module_1_complete'
+    selected_indrive_modules = st.sidebar.multiselect(
+        "Require completion of these indrive modules (AND semantics):",
+        options=indrive_options,
+        default=[]
+    )
+
     # Apply filters (cohort, modules, post-quiz) — keep logic unchanged
     df_filtered = df.copy()
     if cohort_sel and "All" not in cohort_sel:
@@ -435,6 +444,16 @@ def render_contacts_modules_page():
         df_filtered = df_filtered[df_filtered["count_posts_completed"] == int(post_filter_n)]
     elif post_filter_mode == "At least":
         df_filtered = df_filtered[df_filtered["count_posts_completed"] >= int(post_filter_n)]
+
+    # APPLY NEW Indrive module filter (AND): require selected indrive modules to equal 1
+    if selected_indrive_modules:
+        # ensure numeric coercion already done; treat missing as 0
+        for col in selected_indrive_modules:
+            if col in df_filtered.columns:
+                df_filtered = df_filtered[df_filtered[col] == 1]
+            else:
+                # if column missing, treat as none completed (filter will yield empty)
+                df_filtered = df_filtered[[]]
 
     st.markdown(f"**Showing {len(df_filtered):,} unique whatsapp ids**")
 
