@@ -388,8 +388,8 @@ def show_login_modal():
 # ---------------------------
 
 def render_contacts_modules_page():
-    st.header("Contacts — Module & Post-Quiz Progress")
-    st.markdown("Aggregated per **whatsapp_id**. Extracted from `details` JSON in the `contacts` table.")
+    st.header("Whatsapp Id's Progress In Modules Can Be Tracked With This")
+    st.markdown("The Total Users Are Whatsapp Unique Id's")
 
     with st.spinner("Fetching contacts data..."):
         contacts_df = fetch_contacts_progress()
@@ -584,7 +584,7 @@ def render_leaderboard_page():
 def main():
     st.set_page_config(page_title="Messages Analytics Dashboard", layout="wide")
     st.title("Messages Analytics Dashboard")
-    st.markdown("Analyze user engagement patterns from BigQuery tables.")
+    st.markdown("Data Of Users According to Whatsapp Id's")
 
     # Initialize session state
     if "authenticated" not in st.session_state:
